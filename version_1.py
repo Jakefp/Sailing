@@ -63,11 +63,126 @@ def add_kinematics(df):
     df["distance_m"] = distances[1:]
     return df
 
+@st.cache_data(show_spinner=False)
+def generate_ladder_lines(lat_tuple, lon_tuple, wind_from_deg, spacing_m=50.0, extend_factor=1.1):
+    """
+    Creates ladder lines (crosswind-parallel lines) spaced along the wind axis.
+
+    lat_tuple, lon_tuple: tuples of lat/lon values (for caching).
+    wind_from_deg: meteorological "from" direction in degrees (0=N, 90=E).
+    spacing_m: distance between ladder lines along the wind axis (meters).
+    extend_factor: how much longer than the data extent the lines should be.
+    Returns: list of dicts with 'lats' and 'lons'
+    """
+    lat_series = pd.Series(lat_tuple)
+    lon_series = pd.Series(lon_tuple)
+    if len(lat_series) == 0:
+        return []
+
+    # Use a local tangent-plane approximation for bounding / placement
+    lat0 = float(lat_series.mean())
+    lon0 = float(lon_series.mean())
+
+    lat = lat_series.to_numpy(dtype=float)
+    lon = lon_series.to_numpy(dtype=float)
+
+    # meters per degree
+    m_per_deg_lat = 110540.0
+    m_per_deg_lon = 111320.0 * np.cos(np.radians(lat0))
+
+    # Convert to local XY meters (east=x, north=y)
+    x = (lon - lon0) * m_per_deg_lon
+    y = (lat - lat0) * m_per_deg_lat
+
+    # Wind axis direction "to" (so offsets march downwind/upwind consistently)
+    wind_to_deg = (wind_from_deg + 180) % 360
+
+    # Unit vectors for wind axis (a) and perpendicular/crosswind axis (p)
+    a = np.array([np.sin(np.radians(wind_to_deg)), np.cos(np.radians(wind_to_deg))])  # along-wind
+    p_deg = (wind_to_deg + 90) % 360
+    p = np.array([np.sin(np.radians(p_deg)), np.cos(np.radians(p_deg))])              # perpendicular to wind
+
+    # Project points onto wind axis to find min/max extent
+    t = x * a[0] + y * a[1]  # along-wind coordinate (meters)
+    t_min, t_max = float(np.min(t)), float(np.max(t))
+
+    if spacing_m <= 0:
+        return []
+
+    # Determine ladder offsets (meters) covering the extent
+    start = np.floor(t_min / spacing_m) * spacing_m
+    end = np.ceil(t_max / spacing_m) * spacing_m
+    offsets = np.arange(start, end + spacing_m, spacing_m)
+
+    # Determine crosswind span for line length
+    s = x * p[0] + y * p[1]  # crosswind coordinate
+    half_len = 0.5 * (float(np.max(s)) - float(np.min(s))) * extend_factor
+    half_len = max(half_len, spacing_m * 2)  # ensure visible even if tight track
+
+    lines = []
+    center_point = (lat0, lon0)
+
+    for off in offsets:
+        # Line center point in XY meters relative to origin
+        cx, cy = off * a[0], off * a[1]
+
+        # Convert that center back to lat/lon approx
+        clat = lat0 + (cy / m_per_deg_lat)
+        clon = lon0 + (cx / m_per_deg_lon)
+
+        # Compute line endpoints using geodesic destination for accuracy
+        # Endpoints go along p_deg and opposite
+        p1 = geodesic(meters=half_len).destination((clat, clon), p_deg)
+        p2 = geodesic(meters=half_len).destination((clat, clon), (p_deg + 180) % 360)
+
+        lines.append({
+            "lats": [p1.latitude, p2.latitude],
+            "lons": [p1.longitude, p2.longitude]
+        })
+
+    return lines
+
+def add_stitched_time(df, time_ranges):
+    """
+    Adds a 't_play_s' column: seconds along a gapless timeline created by concatenating time_ranges.
+    df must contain tz-aware 'time' column.
+    Only rows within time_ranges should be passed in (or they'll become NaN).
+    """
+    # Ensure ranges are sorted by start time
+    ranges = sorted(time_ranges, key=lambda x: x[0])
+
+    # Precompute cumulative offsets
+    offsets = []
+    cum = 0.0
+    for start_t, end_t in ranges:
+        offsets.append((start_t, end_t, cum))
+        cum += (end_t - start_t).total_seconds()
+
+    t_play = np.full(len(df), np.nan, dtype=float)
+    times = df["time"].to_numpy()
+
+    for (start_t, end_t, base) in offsets:
+        mask = (df["time"] >= start_t) & (df["time"] <= end_t)
+        # seconds from start of this segment + cumulative base
+        t_play[mask.to_numpy()] = base + (df.loc[mask, "time"] - start_t).dt.total_seconds().to_numpy()
+
+    out = df.copy()
+    out["t_play_s"] = t_play
+    out = out.dropna(subset=["t_play_s"])
+    return out
+
 # ----------- Uploading functions -------------
 
-def process_fit_gz(file_obj):
-    with gzip.open(file_obj, 'rb') as f:
-        fit_data = f.read()
+@st.cache_data(show_spinner="Processing FIT file...")
+def process_fit_gz(file_bytes: bytes):
+    """Cached FIT/FIT.GZ parser. Pass file.read() bytes, not file object."""
+    try:
+        # Try to decompress as gzip first
+        fit_data = gzip.decompress(file_bytes)
+    except gzip.BadGzipFile:
+        # Not gzipped, use raw bytes
+        fit_data = file_bytes
+
     fitfile = FitFile(BytesIO(fit_data))
     records = []
     for record in fitfile.get_messages("record"):
@@ -90,11 +205,10 @@ def process_fit_gz(file_obj):
     df = add_kinematics(df)
     return df
 
-def process_gpx(file_obj):
-    # Read and parse XML
-    content = file_obj.read()
-    if isinstance(content, bytes):
-        content = content.decode("utf-8", errors="ignore")
+@st.cache_data(show_spinner="Processing GPX file...")
+def process_gpx(file_bytes: bytes):
+    """Cached GPX parser. Pass file.read() bytes, not file object."""
+    content = file_bytes.decode("utf-8", errors="ignore") if isinstance(file_bytes, bytes) else file_bytes
 
     root = ET.fromstring(content)
 
@@ -127,8 +241,10 @@ def process_gpx(file_obj):
     df = add_kinematics(df)
     return df
 
-def process_csv(file_obj):
-    df_raw = pd.read_csv(file_obj)
+@st.cache_data(show_spinner="Processing CSV file...")
+def process_csv(file_bytes: bytes):
+    """Cached CSV parser. Pass file.read() bytes, not file object."""
+    df_raw = pd.read_csv(BytesIO(file_bytes))
 
     if df_raw.empty:
         raise ValueError("CSV file is empty")
@@ -136,9 +252,9 @@ def process_csv(file_obj):
     # Try to detect column names (case-insensitive)
     cols_lower = {c.lower(): c for c in df_raw.columns}
 
-    lat_col = next((cols_lower[c] for c in ["lat", "latitude", "position_lat"]), None)
-    lon_col = next((cols_lower[c] for c in ["lon", "lng", "longitude", "position_long"]), None)
-    time_col = next((cols_lower[c] for c in ["time", "timestamp", "date_time", "datetime"]), None)
+    lat_col = next((cols_lower[c] for c in ["lat", "latitude", "position_lat"] if c in cols_lower), None)
+    lon_col = next((cols_lower[c] for c in ["lon", "lng", "longitude", "position_long"] if c in cols_lower), None)
+    time_col = next((cols_lower[c] for c in ["time", "timestamp", "date_time", "datetime"] if c in cols_lower), None)
 
     if lat_col is None or lon_col is None or time_col is None:
         raise ValueError(
@@ -165,6 +281,7 @@ def process_csv(file_obj):
     df = add_kinematics(df)
     return df
 
+
 # ---------- Upload & Process ----------
 uploaded_files = st.file_uploader(
     "Upload one or more GPS files (.fit.gz, .fit, .gpx, .csv)",
@@ -186,14 +303,15 @@ if uploaded_files:
         )
 
         ext = filename.lower()
+        file_bytes = file.read()  # Read once for caching
 
         try:
             if ext.endswith(".fit.gz") or ext.endswith(".fit"):
-                df = process_fit_gz(file)
+                df = process_fit_gz(file_bytes)
             elif ext.endswith(".gpx"):
-                df = process_gpx(file)
+                df = process_gpx(file_bytes)
             elif ext.endswith(".csv"):
-                df = process_csv(file)
+                df = process_csv(file_bytes)
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
 
@@ -235,20 +353,47 @@ if sailor_data:
         )
         time_ranges.append((start_i, end_i))
 
-    smoothing = st.slider(
-    "Polar smoothing amount", min_value=0.0, max_value=1.0, value=0.3, step=0.05,
-    help="0 = no smoothing, 1 = full smoothing with neighbors"
+        # ---------- Layout: Map and Polar ----------
+    col1, col2, col3 = st.columns([3, 3, 3])
+    with col1:
+        st.subheader("Track Map")
+        map_bearing = st.number_input(
+        "Wind Direction (degrees)",
+        min_value=0,
+        max_value=359,
+        value=0,
+        step=1,
+        format="%d",
+        help="Rotates the map clockwise. 0 = North-up. 90 = East-up."
+        )
+        ladder_spacing_m = st.number_input(
+        "Ladder line spacing (meters)",
+        min_value=5.0,
+        max_value=1000.0,
+        value=50.0,
+        step=5.0,
+        format="%.0f"
+        )
+        show_ladder = st.checkbox("Show ladder lines (perpendicular to wind)", value=False)
+
+    with col2:
+        st.subheader("Polar Smoothing")
+        smoothing = st.slider(
+        "Polar smoothing amount", min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+        help="0 = no smoothing, 1 = full smoothing with neighbors"
     )
 
-    # 🆕 Minimum boatspeed filter for polar plot
-    min_speed_knots = st.number_input(
-    "Minimum boatspeed to include in polars (knots)",
-    min_value=0.0,
-    max_value=50.0,
-    value=0.0,
-    step=0.01,
-    format="%.2f",
-    help="Speeds below this value are excluded from the polar averages"
+    with col3:
+        st.subheader("Minimum Speed for Polars")
+        # 🆕 Minimum boatspeed filter for polar plot
+        min_speed_knots = st.number_input(
+        "Minimum boatspeed to include in polars (knots)",
+        min_value=0.0,
+        max_value=50.0,
+        value=0.0,
+        step=0.01,
+        format="%.2f",
+        help="Speeds below this value are excluded from the polar averages"
     )
 
     # ---------- Polar Plot ----------
@@ -272,11 +417,27 @@ if sailor_data:
         mapbox_style="open-street-map",
         mapbox=dict(
             center=dict(lat=all_lats.mean(), lon=all_lons.mean()),
-            zoom=15 if all_lats.std() + all_lons.std() < 0.01 else 13 if all_lats.std() + all_lons.std() < 0.05 else 12
+            zoom=15 if all_lats.std() + all_lons.std() < 0.01 else 13 if all_lats.std() + all_lons.std() < 0.05 else 12,
+            bearing=map_bearing
         ),
         height=500,
         margin=dict(r=0, l=0, t=0, b=0)
     )
+
+    if show_ladder:
+        ladder_lines = generate_ladder_lines(tuple(all_lats), tuple(all_lons), map_bearing, spacing_m=ladder_spacing_m)
+
+        for ln in ladder_lines:
+            track_fig.add_trace(go.Scattermapbox(
+                lat=ln["lats"],
+                lon=ln["lons"],
+                mode="lines",
+                line=dict(width=0.8,color='lightgrey'),      # keep subtle
+                opacity=0.9,
+                hoverinfo="skip",
+                showlegend=False
+            ))
+
 
     # ---------- Process and Plot Each Sailor ----------
     summary_rows = []
@@ -361,6 +522,213 @@ if sailor_data:
     with col2:
         st.subheader("Polar Diagram")
         st.plotly_chart(polar_fig, use_container_width=True)
+
+
+    st.markdown("### Playback")
+
+    enable_playback = st.checkbox("Enable playback", value=False)
+
+    col1, col2, col3 = st.columns([3, 3, 3])
+    with col1:
+        tail_seconds = st.number_input(
+        "Tail length (seconds)",
+        min_value=0,
+        max_value=600,
+        value=60,
+        step=5,
+        format="%d"
+    )
+    with col2:
+        playback_speed = st.selectbox(
+        "Playback speed",
+        options=[0.5, 1, 2, 4, 8],
+        index=1
+    )
+    with col3:
+        frame_step_s = st.number_input(
+        "Playback timestep (seconds per frame)",
+        min_value=1,
+        max_value=10,
+        value=1,
+        step=1,
+        format="%d",
+        help="Bigger timestep = fewer frames = faster app."
+    )
+        
+    if enable_playback:
+        # ---- Build per-sailor filtered data using your existing time_mask logic ----
+        playback_sailors = []
+        for s in sailor_data:
+            df = s["df"].copy()
+
+            # Apply your multi-range time mask (same logic you already use)
+            time_mask = pd.Series(False, index=df.index)
+            for start_t, end_t in time_ranges:
+                time_mask |= (df["time"] >= start_t) & (df["time"] <= end_t)
+            df = df[time_mask].copy()
+            if df.empty:
+                continue
+
+            # Add stitched timeline
+            df = add_stitched_time(df, time_ranges)
+
+            # OPTIONAL PERFORMANCE: resample to 1 point per frame_step_s (approx)
+            # We'll bin by playback time seconds
+            df["t_bin"] = (df["t_play_s"] // frame_step_s) * frame_step_s
+            df = df.sort_values("t_play_s").groupby("t_bin", as_index=False).last()
+
+            playback_sailors.append({
+                "name": s["name"],
+                "color": s["color"],
+                "df": df.sort_values("t_play_s").reset_index(drop=True)
+            })
+
+        if len(playback_sailors) == 0:
+            st.info("No playback data found in the selected time ranges.")
+        else:
+            # Determine global playback span
+            t_min = min(ps["df"]["t_play_s"].min() for ps in playback_sailors)
+            t_max = max(ps["df"]["t_play_s"].max() for ps in playback_sailors)
+
+            # Frame times
+            frame_times = np.arange(
+                np.floor(t_min / frame_step_s) * frame_step_s,
+                np.ceil(t_max / frame_step_s) * frame_step_s + frame_step_s,
+                frame_step_s
+            )
+
+            # Base figure
+            playback_fig = go.Figure()
+            playback_fig.update_layout(
+                mapbox_style="open-street-map",
+                mapbox=dict(
+                    center=dict(lat=all_lats.mean(), lon=all_lons.mean()),
+                    zoom=15 if all_lats.std() + all_lons.std() < 0.01 else 13 if all_lats.std() + all_lons.std() < 0.05 else 12,
+                    bearing=map_bearing
+                ),
+                height=550,
+                margin=dict(r=0, l=0, t=10, b=0),
+                showlegend=True,
+                legend=dict(orientation="h")
+            )
+
+            # Initialize traces (2 per sailor: tail line + current marker)
+            for ps in playback_sailors:
+                name = ps["name"]
+                color = ps["color"]
+
+                playback_fig.add_trace(go.Scattermapbox(
+                    lat=[], lon=[],
+                    mode="lines",
+                    name=f"{name} tail",
+                    line=dict(color=color, width=2),
+                    showlegend=False
+                ))
+                playback_fig.add_trace(go.Scattermapbox(
+                    lat=[], lon=[],
+                    mode="markers",
+                    name=name,
+                    marker=dict(size=14, color=color)
+                ))
+
+            # Pre-extract arrays for fast slicing
+            pre = []
+            for ps in playback_sailors:
+                d = ps["df"]
+                pre.append({
+                    "t": d["t_play_s"].to_numpy(),
+                    "lat": d["lat"].to_numpy(),
+                    "lon": d["lon"].to_numpy(),
+                    "time": d["time"].to_numpy()
+                })
+
+            # Build mapping from t_play_s to actual timestamp for slider labels
+            # Use the first sailor's data as reference for timestamps
+            ref_df = playback_sailors[0]["df"]
+            t_to_time = dict(zip(ref_df["t_play_s"], ref_df["time"]))
+
+            frames = []
+            for t_now in frame_times:
+                frame_data = []
+                for idx, ps in enumerate(playback_sailors):
+                    arr = pre[idx]
+                    t_arr = arr["t"]
+
+                    # tail window
+                    t0 = t_now - tail_seconds
+                    i0 = np.searchsorted(t_arr, t0, side="left")
+                    i1 = np.searchsorted(t_arr, t_now, side="right")
+
+                    tail_lat = arr["lat"][i0:i1].tolist()
+                    tail_lon = arr["lon"][i0:i1].tolist()
+
+                    # current point = last point within window
+                    if i1 > 0:
+                        cur_i = min(i1 - 1, len(t_arr) - 1)
+                        cur_lat = [float(arr["lat"][cur_i])]
+                        cur_lon = [float(arr["lon"][cur_i])]
+                    else:
+                        cur_lat, cur_lon = [], []
+
+                    # Add in same order as traces: tail then marker
+                    frame_data.append(go.Scattermapbox(lat=tail_lat, lon=tail_lon))
+                    frame_data.append(go.Scattermapbox(lat=cur_lat, lon=cur_lon))
+
+                frames.append(go.Frame(name=str(int(t_now)), data=frame_data))
+
+            playback_fig.frames = frames
+
+            # Control animation speed: Plotly frame duration in ms
+            # "normal speed" means 1 playback second per real second, so frame duration = frame_step_s * 1000 / speed
+            frame_duration_ms = int((frame_step_s * 1000) / float(playback_speed))
+
+            playback_fig.update_layout(
+                updatemenus=[dict(
+                    type="buttons",
+                    showactive=False,
+                    x=0.0, y=1.08,
+                    xanchor="left", yanchor="top",
+                    buttons=[
+                        dict(
+                            label="Play",
+                            method="animate",
+                            args=[None, dict(
+                                frame=dict(duration=frame_duration_ms, redraw=True),
+                                transition=dict(duration=0),
+                                fromcurrent=True,
+                                mode="immediate"
+                            )]
+                        ),
+                        dict(
+                            label="Pause",
+                            method="animate",
+                            args=[[None], dict(
+                                frame=dict(duration=0, redraw=False),
+                                mode="immediate",
+                                transition=dict(duration=0)
+                            )]
+                        )
+                    ]
+                )],
+                sliders=[dict(
+                    active=0,
+                    x=0.0, y=0.0,
+                    xanchor="left", yanchor="top",
+                    len=1.0,
+                    steps=[dict(
+                        label=pd.Timestamp(t_to_time.get(t, t_to_time.get(min(t_to_time.keys(), key=lambda k: abs(k - t))))).strftime("%H:%M:%S") if t_to_time else str(int(t)),
+                        method="animate",
+                        args=[[str(int(t))], dict(
+                            frame=dict(duration=0, redraw=True),
+                            transition=dict(duration=0),
+                            mode="immediate"
+                        )]
+                    ) for t in frame_times]
+                )]
+            )
+
+            st.subheader("Playback")
+            st.plotly_chart(playback_fig, use_container_width=True)
 
 
 # ========== Summary Table ============
