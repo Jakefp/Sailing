@@ -382,37 +382,6 @@ if sailor_data:
         format="%.2f",
         help="Speeds below this value are excluded from the polar averages"
     )
-    st.markdown("### Playback")
-
-    enable_playback = st.checkbox("Enable playback", value=False)
-
-    col1, col2, col3 = st.columns([3, 3, 3])
-    with col1:
-        tail_seconds = st.number_input(
-        "Tail length (seconds)",
-        min_value=0,
-        max_value=600,
-        value=30,
-        step=5,
-        format="%d"
-    )
-    with col2:
-        playback_speed = st.selectbox(
-        "Playback speed",
-        options=[0.5, 1, 2, 4, 8],
-        index=1
-    )
-    with col3:
-        frame_step_s = st.number_input(
-        "Playback timestep (seconds per frame)",
-        min_value=1,
-        max_value=10,
-        value=1,
-        step=1,
-        format="%d",
-        help="Bigger timestep = fewer frames = faster app."
-    )
-
 
     # ---------- Polar Plot ----------
     polar_fig = go.Figure()
@@ -540,6 +509,38 @@ if sailor_data:
     with col2:
         st.subheader("Polar Diagram")
         st.plotly_chart(polar_fig, use_container_width=True)
+
+
+    st.markdown("### Playback")
+
+    enable_playback = st.checkbox("Enable playback", value=False)
+
+    col1, col2, col3 = st.columns([3, 3, 3])
+    with col1:
+        tail_seconds = st.number_input(
+        "Tail length (seconds)",
+        min_value=0,
+        max_value=600,
+        value=30,
+        step=5,
+        format="%d"
+    )
+    with col2:
+        playback_speed = st.selectbox(
+        "Playback speed",
+        options=[0.5, 1, 2, 4, 8],
+        index=1
+    )
+    with col3:
+        frame_step_s = st.number_input(
+        "Playback timestep (seconds per frame)",
+        min_value=1,
+        max_value=10,
+        value=1,
+        step=1,
+        format="%d",
+        help="Bigger timestep = fewer frames = faster app."
+    )
         
     if enable_playback:
         # ---- Build per-sailor filtered data using your existing time_mask logic ----
@@ -612,11 +613,9 @@ if sailor_data:
                 ))
                 playback_fig.add_trace(go.Scattermapbox(
                     lat=[], lon=[],
-                    mode="markers+text",
+                    mode="markers",
                     name=name,
-                    marker=dict(size=14, color=color),  # big pointer
-                    text=[name],
-                    textposition="top right"
+                    marker=dict(size=14, color=color)
                 ))
 
             # Pre-extract arrays for fast slicing
@@ -626,8 +625,14 @@ if sailor_data:
                 pre.append({
                     "t": d["t_play_s"].to_numpy(),
                     "lat": d["lat"].to_numpy(),
-                    "lon": d["lon"].to_numpy()
+                    "lon": d["lon"].to_numpy(),
+                    "time": d["time"].to_numpy()
                 })
+
+            # Build mapping from t_play_s to actual timestamp for slider labels
+            # Use the first sailor's data as reference for timestamps
+            ref_df = playback_sailors[0]["df"]
+            t_to_time = dict(zip(ref_df["t_play_s"], ref_df["time"]))
 
             frames = []
             for t_now in frame_times:
@@ -694,11 +699,11 @@ if sailor_data:
                 )],
                 sliders=[dict(
                     active=0,
-                    x=0.0, y=1.02,
+                    x=0.0, y=0.0,
                     xanchor="left", yanchor="top",
                     len=1.0,
                     steps=[dict(
-                        label=str(int(t)),
+                        label=pd.Timestamp(t_to_time.get(t, t_to_time.get(min(t_to_time.keys(), key=lambda k: abs(k - t))))).strftime("%H:%M:%S") if t_to_time else str(int(t)),
                         method="animate",
                         args=[[str(int(t))], dict(
                             frame=dict(duration=0, redraw=True),
