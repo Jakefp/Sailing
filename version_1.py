@@ -63,15 +63,19 @@ def add_kinematics(df):
     df["distance_m"] = distances[1:]
     return df
 
-def generate_ladder_lines(lat_series, lon_series, wind_from_deg, spacing_m=50.0, extend_factor=1.1):
+@st.cache_data(show_spinner=False)
+def generate_ladder_lines(lat_tuple, lon_tuple, wind_from_deg, spacing_m=50.0, extend_factor=1.1):
     """
     Creates ladder lines (crosswind-parallel lines) spaced along the wind axis.
 
+    lat_tuple, lon_tuple: tuples of lat/lon values (for caching).
     wind_from_deg: meteorological "from" direction in degrees (0=N, 90=E).
     spacing_m: distance between ladder lines along the wind axis (meters).
     extend_factor: how much longer than the data extent the lines should be.
     Returns: list of dicts with 'lats' and 'lons'
     """
+    lat_series = pd.Series(lat_tuple)
+    lon_series = pd.Series(lon_tuple)
     if len(lat_series) == 0:
         return []
 
@@ -169,9 +173,16 @@ def add_stitched_time(df, time_ranges):
 
 # ----------- Uploading functions -------------
 
-def process_fit_gz(file_obj):
-    with gzip.open(file_obj, 'rb') as f:
-        fit_data = f.read()
+@st.cache_data(show_spinner="Processing FIT file...")
+def process_fit_gz(file_bytes: bytes):
+    """Cached FIT/FIT.GZ parser. Pass file.read() bytes, not file object."""
+    try:
+        # Try to decompress as gzip first
+        fit_data = gzip.decompress(file_bytes)
+    except gzip.BadGzipFile:
+        # Not gzipped, use raw bytes
+        fit_data = file_bytes
+
     fitfile = FitFile(BytesIO(fit_data))
     records = []
     for record in fitfile.get_messages("record"):
@@ -194,11 +205,10 @@ def process_fit_gz(file_obj):
     df = add_kinematics(df)
     return df
 
-def process_gpx(file_obj):
-    # Read and parse XML
-    content = file_obj.read()
-    if isinstance(content, bytes):
-        content = content.decode("utf-8", errors="ignore")
+@st.cache_data(show_spinner="Processing GPX file...")
+def process_gpx(file_bytes: bytes):
+    """Cached GPX parser. Pass file.read() bytes, not file object."""
+    content = file_bytes.decode("utf-8", errors="ignore") if isinstance(file_bytes, bytes) else file_bytes
 
     root = ET.fromstring(content)
 
@@ -231,8 +241,10 @@ def process_gpx(file_obj):
     df = add_kinematics(df)
     return df
 
-def process_csv(file_obj):
-    df_raw = pd.read_csv(file_obj)
+@st.cache_data(show_spinner="Processing CSV file...")
+def process_csv(file_bytes: bytes):
+    """Cached CSV parser. Pass file.read() bytes, not file object."""
+    df_raw = pd.read_csv(BytesIO(file_bytes))
 
     if df_raw.empty:
         raise ValueError("CSV file is empty")
@@ -240,9 +252,9 @@ def process_csv(file_obj):
     # Try to detect column names (case-insensitive)
     cols_lower = {c.lower(): c for c in df_raw.columns}
 
-    lat_col = next((cols_lower[c] for c in ["lat", "latitude", "position_lat"]), None)
-    lon_col = next((cols_lower[c] for c in ["lon", "lng", "longitude", "position_long"]), None)
-    time_col = next((cols_lower[c] for c in ["time", "timestamp", "date_time", "datetime"]), None)
+    lat_col = next((cols_lower[c] for c in ["lat", "latitude", "position_lat"] if c in cols_lower), None)
+    lon_col = next((cols_lower[c] for c in ["lon", "lng", "longitude", "position_long"] if c in cols_lower), None)
+    time_col = next((cols_lower[c] for c in ["time", "timestamp", "date_time", "datetime"] if c in cols_lower), None)
 
     if lat_col is None or lon_col is None or time_col is None:
         raise ValueError(
@@ -291,14 +303,15 @@ if uploaded_files:
         )
 
         ext = filename.lower()
+        file_bytes = file.read()  # Read once for caching
 
         try:
             if ext.endswith(".fit.gz") or ext.endswith(".fit"):
-                df = process_fit_gz(file)
+                df = process_fit_gz(file_bytes)
             elif ext.endswith(".gpx"):
-                df = process_gpx(file)
+                df = process_gpx(file_bytes)
             elif ext.endswith(".csv"):
-                df = process_csv(file)
+                df = process_csv(file_bytes)
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
 
@@ -412,7 +425,7 @@ if sailor_data:
     )
 
     if show_ladder:
-        ladder_lines = generate_ladder_lines(all_lats, all_lons, map_bearing, spacing_m=ladder_spacing_m)
+        ladder_lines = generate_ladder_lines(tuple(all_lats), tuple(all_lons), map_bearing, spacing_m=ladder_spacing_m)
 
         for ln in ladder_lines:
             track_fig.add_trace(go.Scattermapbox(
@@ -521,7 +534,7 @@ if sailor_data:
         "Tail length (seconds)",
         min_value=0,
         max_value=600,
-        value=30,
+        value=60,
         step=5,
         format="%d"
     )
