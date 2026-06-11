@@ -13,55 +13,89 @@ import os
 import xml.etree.ElementTree as ET  # for GPX parsing
 
 
-# Set Mapbox token
-os.environ["MAPBOX_ACCESS_TOKEN"] = "pk.eyJ1IjoiamFrZWZwLXNhaWxpbmciLCJhIjoiY21ha2theHZzMTN2NTJqcHoxeXRwMmFnOCJ9.VLxCKga5g5XjCZNos-kqGw"
+# Optional Mapbox token. The map uses the free "open-street-map" style, so no
+# token is required. To use a Mapbox basemap, set MAPBOX_ACCESS_TOKEN in the
+# environment or in Streamlit secrets (do NOT hardcode tokens in source).
+_mapbox_token = os.environ.get("MAPBOX_ACCESS_TOKEN", "")
+try:
+    _mapbox_token = _mapbox_token or st.secrets.get("MAPBOX_ACCESS_TOKEN", "")
+except Exception:
+    pass
+if _mapbox_token:
+    os.environ["MAPBOX_ACCESS_TOKEN"] = _mapbox_token
 
 st.set_page_config(layout="wide")
 st.title("Multi-Sailor GPS Analyzer")
 
 # ---------- Helper Functions ----------
-def compute_bearing(p1, p2):
-    lat1, lon1 = np.radians(p1)
-    lat2, lon2 = np.radians(p2)
-    dlon = lon2 - lon1
-    x = np.sin(dlon) * np.cos(lat2)
-    y = np.cos(lat1)*np.sin(lat2) - np.sin(lat1)*np.cos(lat2)*np.cos(dlon)
-    return (np.degrees(np.arctan2(x, y)) + 360) % 360
-
 def add_kinematics(df):
     """
     Expects a DataFrame with columns: 'lat', 'lon', 'time' (tz-aware).
     Returns a new DataFrame with speed, speed_knots, heading, distance_m.
+
+    Fully vectorised (haversine distance + great-circle bearing) so large
+    GPX/FIT files process in a fraction of the time of a per-point loop.
     """
     # Ensure chronological order
     df = df.sort_values("time").reset_index(drop=True)
+    if len(df) < 2:
+        return df.iloc[0:0].copy()
 
-    lats = df["lat"].values
-    lons = df["lon"].values
-    times = df["time"].values
+    lat = np.radians(df["lat"].to_numpy(dtype=float))
+    lon = np.radians(df["lon"].to_numpy(dtype=float))
+    # Seconds between consecutive (tz-aware) samples, robust to timezone dtype
+    dt = df["time"].diff().dt.total_seconds().to_numpy()[1:]
 
-    speeds = []
-    headings = []
-    distances = [0]  # pairwise segment distances
+    dlat = lat[1:] - lat[:-1]
+    dlon = lon[1:] - lon[:-1]
 
-    for i in range(1, len(df)):
-        p1 = (lats[i - 1], lons[i - 1])
-        p2 = (lats[i], lons[i])
+    # Haversine distance between consecutive points (meters)
+    R = 6371000.0
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat[:-1]) * np.cos(lat[1:]) * np.sin(dlon / 2) ** 2
+    dist = 2 * R * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
-        dist = geodesic(p1, p2).meters
-        duration = (times[i] - times[i - 1]) / np.timedelta64(1, "s")
+    # Great-circle initial bearing between consecutive points (degrees)
+    x = np.sin(dlon) * np.cos(lat[1:])
+    y = np.cos(lat[:-1]) * np.sin(lat[1:]) - np.sin(lat[:-1]) * np.cos(lat[1:]) * np.cos(dlon)
+    heading = (np.degrees(np.arctan2(x, y)) + 360) % 360
 
-        speeds.append(dist / duration if duration > 0 else 0)
-        headings.append(compute_bearing(p1, p2))
-        distances.append(dist)
+    speed = np.where(dt > 0, dist / dt, 0.0)
 
     # Drop first row to match original behaviour
-    df = df.iloc[1:].copy()
-    df["speed"] = speeds
-    df["speed_knots"] = df["speed"] * 1.94384
-    df["heading"] = headings
-    df["distance_m"] = distances[1:]
-    return df
+    out = df.iloc[1:].copy()
+    out["speed"] = speed
+    out["speed_knots"] = speed * 1.94384
+    out["heading"] = heading
+    out["distance_m"] = dist
+    return out
+
+
+def vmg_line_polar(height, wind_dir, r_max, upwind=True, n=181):
+    """
+    Build the polar coordinates of a horizontal VMG line across the polar diagram.
+
+    The polar is rotated so the wind direction sits at the top of the chart.
+    A horizontal line on screen at vertical distance ``height`` (knots of velocity
+    made good) maps to r = height / cos(angle-from-top). Returns (theta, r) arrays
+    in compass degrees / knots, clipped to the visible radius ``r_max``.
+    """
+    if height <= 0:
+        return np.array([]), np.array([])
+
+    if upwind:
+        a = np.linspace(-85, 85, n)   # screen angle from top (deg), near wind = top
+        y = height
+    else:
+        a = np.linspace(95, 265, n)   # near bottom of the chart
+        y = -height
+
+    cos_a = np.cos(np.radians(a))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = y / cos_a
+    theta = (wind_dir + a) % 360
+
+    mask = (r > 0) & (r <= r_max)
+    return theta[mask], r[mask]
 
 @st.cache_data(show_spinner=False)
 def generate_ladder_lines(lat_tuple, lon_tuple, wind_from_deg, spacing_m=50.0, extend_factor=1.1):
@@ -357,14 +391,15 @@ if sailor_data:
     col1, col2, col3 = st.columns([3, 3, 3])
     with col1:
         st.subheader("Track Map")
-        map_bearing = st.number_input(
+        wind_dir = st.number_input(
         "Wind Direction (degrees)",
         min_value=0,
         max_value=359,
         value=0,
         step=1,
         format="%d",
-        help="Rotates the map clockwise. 0 = North-up. 90 = East-up."
+        help="Direction the wind is coming FROM. Rotates the map clockwise and "
+             "spins the polar so the wind blows from the top of the diagram."
         )
         ladder_spacing_m = st.number_input(
         "Ladder line spacing (meters)",
@@ -382,6 +417,19 @@ if sailor_data:
         "Polar smoothing amount", min_value=0.0, max_value=1.0, value=0.5, step=0.05,
         help="0 = no smoothing, 1 = full smoothing with neighbors"
     )
+        show_vmg = st.checkbox("Show VMG lines", value=False,
+        help="Horizontal lines across the polar marking upwind / downwind "
+             "velocity made good. Drag the sliders to move them up and down.")
+        if show_vmg:
+            upwind_vmg = st.slider(
+                "Upwind VMG line (knots)", min_value=0.0, max_value=20.0,
+                value=0.0, step=0.1)
+            downwind_vmg = st.slider(
+                "Downwind VMG line (knots)", min_value=0.0, max_value=20.0,
+                value=0.0, step=0.1)
+        else:
+            upwind_vmg = 0.0
+            downwind_vmg = 0.0
 
     with col3:
         st.subheader("Minimum Speed for Polars")
@@ -397,11 +445,15 @@ if sailor_data:
     )
 
     # ---------- Polar Plot ----------
+    # Rotate the angular axis so the wind direction sits at the top of the chart.
+    # With direction="clockwise", placing theta=0 at (90 + wind_dir) degrees CCW
+    # from east makes the wind heading appear at 12 o'clock (e.g. wind 090 spins
+    # the whole diagram 90 degrees anti-clockwise).
     polar_fig = go.Figure()
     polar_fig.update_layout(polar=dict(
         angularaxis=dict(
             direction="clockwise",
-            rotation=90,
+            rotation=(90 + wind_dir) % 360,
             tickmode="linear",
             tick0=0,
             dtick=30,
@@ -418,14 +470,14 @@ if sailor_data:
         mapbox=dict(
             center=dict(lat=all_lats.mean(), lon=all_lons.mean()),
             zoom=15 if all_lats.std() + all_lons.std() < 0.01 else 13 if all_lats.std() + all_lons.std() < 0.05 else 12,
-            bearing=map_bearing
+            bearing=wind_dir
         ),
         height=500,
         margin=dict(r=0, l=0, t=0, b=0)
     )
 
     if show_ladder:
-        ladder_lines = generate_ladder_lines(tuple(all_lats), tuple(all_lons), map_bearing, spacing_m=ladder_spacing_m)
+        ladder_lines = generate_ladder_lines(tuple(all_lats), tuple(all_lons), wind_dir, spacing_m=ladder_spacing_m)
 
         for ln in ladder_lines:
             track_fig.add_trace(go.Scattermapbox(
@@ -441,6 +493,7 @@ if sailor_data:
 
     # ---------- Process and Plot Each Sailor ----------
     summary_rows = []
+    max_polar_speed = 0.0  # track radial extent for VMG line clipping
     for sailor in sailor_data:
         df = sailor["df"]
         name = sailor["name"]
@@ -471,24 +524,23 @@ if sailor_data:
             center_weight = 1 - smoothing
             neighbor_weight = smoothing / 2
 
-            # Apply weighted smoothing
-            smoothed = []
-            for i in range(len(avg)):
-                prev = avg.iloc[i - 1]["speed_knots"] if i > 0 else avg.iloc[-1]["speed_knots"]
-                curr = avg.iloc[i]["speed_knots"]
-                next_ = avg.iloc[(i + 1) % len(avg)]["speed_knots"]
-                smooth_val = neighbor_weight * prev + center_weight * curr + neighbor_weight * next_
-                smoothed.append(smooth_val)
+            # Apply weighted circular smoothing (vectorised wrap-around)
+            speeds = avg["speed_knots"].to_numpy()
+            prev = np.roll(speeds, 1)
+            nxt = np.roll(speeds, -1)
+            avg["smoothed_speed"] = (
+                neighbor_weight * prev + center_weight * speeds + neighbor_weight * nxt
+            )
 
-            avg["smoothed_speed"] = smoothed
+            max_polar_speed = max(max_polar_speed, float(avg["smoothed_speed"].max()))
 
-        polar_fig.add_trace(go.Scatterpolar(
-            r=avg["smoothed_speed"],
-            theta=avg["dir_bin"],
-            name=name,
-            mode="lines+markers",
-            line=dict(color=color)
-        ))
+            polar_fig.add_trace(go.Scatterpolar(
+                r=avg["smoothed_speed"],
+                theta=avg["dir_bin"],
+                name=name,
+                mode="lines+markers",
+                line=dict(color=color)
+            ))
 
         # Track
         track_fig.add_trace(go.Scattermapbox(
@@ -513,6 +565,28 @@ if sailor_data:
 
     summary_df = pd.DataFrame(summary_rows)
 
+    # ---------- VMG lines & radial range ----------
+    r_max = max_polar_speed * 1.1 if max_polar_speed > 0 else 1.0
+    polar_fig.update_layout(polar=dict(radialaxis=dict(range=[0, r_max])))
+
+    if show_vmg:
+        if upwind_vmg > 0:
+            theta, r = vmg_line_polar(upwind_vmg, wind_dir, r_max, upwind=True)
+            polar_fig.add_trace(go.Scatterpolar(
+                r=r, theta=theta, mode="lines",
+                name=f"Upwind VMG ({upwind_vmg:.1f} kn)",
+                line=dict(color="seagreen", dash="dash", width=2),
+                hoverinfo="name"
+            ))
+        if downwind_vmg > 0:
+            theta, r = vmg_line_polar(downwind_vmg, wind_dir, r_max, upwind=False)
+            polar_fig.add_trace(go.Scatterpolar(
+                r=r, theta=theta, mode="lines",
+                name=f"Downwind VMG ({downwind_vmg:.1f} kn)",
+                line=dict(color="darkorange", dash="dash", width=2),
+                hoverinfo="name"
+            ))
+
     # ---------- Layout: Map and Polar ----------
     col1, col2 = st.columns([2, 2])
     with col1:
@@ -524,6 +598,11 @@ if sailor_data:
         st.plotly_chart(polar_fig, use_container_width=True)
 
 
+    # ---------- Playback (DISABLED) ----------
+    # The interactive playback feature is turned off for now so the app focuses
+    # on the tracks and polars. The whole block is kept inside a string literal
+    # so it does nothing; re-enable later by removing the surrounding ''' quotes.
+    _PLAYBACK_DISABLED = '''
     st.markdown("### Playback")
 
     enable_playback = st.checkbox("Enable playback", value=False)
@@ -729,6 +808,8 @@ if sailor_data:
 
             st.subheader("Playback")
             st.plotly_chart(playback_fig, use_container_width=True)
+    '''
+    # ---------- End of disabled playback block ----------
 
 
 # ========== Summary Table ============
